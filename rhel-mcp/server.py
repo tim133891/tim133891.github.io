@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Dependency-free RHEL server management MCP, stdio JSON-RPC."""
-import json, os, pathlib, signal, subprocess, sys, tempfile, threading, time, uuid
+import json, os, pathlib, signal, subprocess, sys, tempfile, threading, time, uuid, re, fnmatch, pty, select
 
 JOBS={}
+SESSIONS={}
 LOCK=threading.Lock()
 KEYS={'CONTROL_PLANE_API_KEY','CONTROL_PLANE_TUNNEL_ID','OPENAI_API_KEY','OPENAI_ADMIN_KEY'}
 def env():
@@ -28,6 +29,29 @@ TOOLS=[
  {'name':'stop_job','description':'Terminate a job started by start_job.',
   'inputSchema':O({'job_id':S('Job ID')},['job_id'])}
 ]
+TOOLS.extend([
+ {'name':'read_multiple_files','description':"Read up to 20 text files",'inputSchema':O({"paths":{'type':'array','items':S('Absolute path'),'maxItems':20}},["paths"])},
+ {'name':'edit_block','description':"Replace a unique exact block in text file",'inputSchema':O({"path":S('path'),"old_text":S('old_text'),"new_text":S('new_text')},["path","old_text","new_text"])},
+ {'name':'get_file_info','description':"Get file size, mode, owner, and dates",'inputSchema':O({"path":S('path')},["path"])},
+ {'name':'create_directory','description':"Create directories recursively",'inputSchema':O({"path":S('path')},["path"])},
+ {'name':'move_file','description':"Rename or move without overwriting",'inputSchema':O({"source":S('source'),"destination":S('destination')},["source","destination"])},
+ {'name':'search_files','description':"Bounded recursive filename and text search",'inputSchema':O({"path":S('path'),"name_glob":S('name_glob'),"contains_text":S('contains_text'),"max_results":I('Number')},["path"])},
+ {'name':'list_processes','description':"Show Linux process list",'inputSchema':O({},[])},
+ {'name':'kill_process','description':"Signal a process",'inputSchema':O({"pid":I('Number'),"signal":S('signal')},["pid"])},
+ {'name':'list_ports','description':"Show listening TCP UDP sockets",'inputSchema':O({},[])},
+ {'name':'service_status','description':"Inspect systemd service",'inputSchema':O({"service":S('service')},["service"])},
+ {'name':'service_action','description':"Start stop restart reload enable disable systemd unit; requires sudo privileges",'inputSchema':O({"service":S('service'),"action":S('action')},["service","action"])},
+ {'name':'list_jobs','description':"Show background jobs",'inputSchema':O({},[])},
+ {'name':'start_session','description':"Create interactive Bash PTY session",'inputSchema':O({"cwd":S('cwd')},[])},
+ {'name':'session_input','description':"Type text in PTY and get output",'inputSchema':O({"session_id":S('session_id'),"input":S('input'),"wait_ms":I('Number')},["session_id","input"])},
+ {'name':'session_output','description':"Get interactive PTY output",'inputSchema':O({"session_id":S('session_id'),"wait_ms":I('Number')},["session_id"])},
+ {'name':'list_sessions','description':"List interactive Bash sessions",'inputSchema':O({},[])},
+ {'name':'stop_session','description':"Stop interactive session",'inputSchema':O({"session_id":S('session_id')},["session_id"])},
+ {'name':'read_pdf','description':"Extract PDF text via pdftotext if installed",'inputSchema':O({"path":S('path'),"pages":I('Number')},["path"])},
+ {'name':'write_pdf','description':"Create simple text PDF via reportlab if installed",'inputSchema':O({"path":S('path'),"text":S('text'),"overwrite":{'type':'boolean'}},["path","text"])},
+ {'name':'read_url','description':"Fetch an HTTPS URL using curl",'inputSchema':O({"url":S('url')},["url"])},
+])
+
 def path(x):
     p=pathlib.Path(x).expanduser()
     if not p.is_absolute(): raise ValueError('Absolute path required')
@@ -106,6 +130,133 @@ def stop(a):
 def info(a):
     return run({'command':"echo HOST; hostname; echo KERNEL; uname -r; echo CPU; lscpu | head -35; echo NUMA; if command -v numactl >/dev/null; then numactl --hardware; else echo 'numactl not installed'; fi; echo MEMORY; free -h; echo DISKS; lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS",'timeout_seconds':20})
 DISPATCH={'run_command':run,'read_file':read,'write_file':write,'list_directory':listing,'system_info':info,'start_job':start,'job_status':status,'stop_job':stop}
+
+def many(a):
+    paths=a['paths']
+    if len(paths)>20: raise ValueError('Too many paths')
+    out=[]
+    for name in paths:
+        try: out.append(read({'path':name,'max_bytes':32768}))
+        except Exception as e: out.append({'path':name,'error':str(e)})
+    return {'files':out}
+def edit(a):
+    p=path(a['path']); content=p.read_text(encoding='utf-8')
+    old=a['old_text']
+    if not old or content.count(old)!=1: raise ValueError('old_text must match exactly once')
+    return write({'path':str(p),'content':content.replace(old,a['new_text'],1),'overwrite':True})
+def stat(a):
+    p=path(a['path']); v=p.lstat()
+    return {'path':str(p),'bytes':v.st_size,'mode':oct(v.st_mode&0o7777),'uid':v.st_uid,'gid':v.st_gid,'mtime':v.st_mtime,'directory':p.is_dir()}
+def mkdir(a):
+    p=path(a['path']); p.mkdir(parents=True,exist_ok=True)
+    return {'path':str(p)}
+def move(a):
+    src=path(a['source']); dst=path(a['destination'])
+    if dst.exists() or dst.is_symlink(): raise ValueError('Destination already exists')
+    src.rename(dst)
+    return {'from':str(src),'to':str(dst)}
+def search(a):
+    base=path(a['path']); pattern=a.get('name_glob') or '*'; needle=a.get('contains_text')
+    results=[]; n=0; start=time.monotonic(); limit=min(100,max(1,int(a.get('max_results',50))))
+    for root,dirs,files in os.walk(base):
+        dirs[:]=[d for d in dirs if d not in ('.git','node_modules','.cache')]
+        for fn in files:
+            n+=1
+            if n>12000 or time.monotonic()-start>10: return {'matches':results,'scanned':n,'truncated':True}
+            if not fnmatch.fnmatch(fn,pattern): continue
+            p=pathlib.Path(root)/fn
+            if needle:
+                try:
+                    if p.stat().st_size>1000000 or needle not in p.read_text(encoding='utf-8'): continue
+                except (OSError,UnicodeError): continue
+            results.append(str(p))
+            if len(results)>=limit: return {'matches':results,'scanned':n,'truncated':True}
+    return {'matches':results,'scanned':n,'truncated':False}
+def processes(a):
+    return run({'command':'ps -eo pid,ppid,user,%cpu,%mem,stat,etimes,args --sort=-%cpu | head -80','timeout_seconds':10})
+def kill(a):
+    pid=int(a['pid'])
+    if pid<=1 or pid==os.getpid(): raise ValueError('Invalid process ID')
+    sig=signal.SIGKILL if a.get('signal','TERM')=='KILL' else signal.SIGTERM
+    os.kill(pid,sig)
+    return {'pid':pid,'signal':sig.name}
+def ports(a): return run({'command':'ss -tulpen','timeout_seconds':10})
+def unit(s):
+    if not re.fullmatch(r'[a-zA-Z0-9_.@:-]+',s): raise ValueError('Invalid service')
+    return s
+def service(a):
+    return run({'command':'systemctl --no-pager status '+unit(a['service'])+' || true','timeout_seconds':10})
+def serviceact(a):
+    action=a['action']
+    if action not in ('start','stop','restart','reload','enable','disable'): raise ValueError('Bad action')
+    return run({'command':'sudo -n systemctl '+action+' '+unit(a['service']),'timeout_seconds':30})
+def jobs(a):
+    with LOCK: items=list(JOBS.items())
+    return {'jobs':[{'job_id':k,'pid':v[0].pid,'running':v[0].poll() is None} for k,v in items]}
+def get_session(id):
+    with LOCK: v=SESSIONS.get(id)
+    if not v: raise ValueError('Unknown session')
+    return v
+def start_session(a):
+    master,slave=pty.openpty()
+    try:
+        p=subprocess.Popen(['/bin/bash','--noprofile','--norc','-i'],stdin=slave,stdout=slave,stderr=slave,env={**env(),'TERM':'xterm'},cwd=str(path(a['cwd'])) if a.get('cwd') else None,start_new_session=True)
+    finally: os.close(slave)
+    os.set_blocking(master,False)
+    id=uuid.uuid4().hex[:12]
+    with LOCK: SESSIONS[id]=(p,master)
+    return {'session_id':id,'pid':p.pid}
+def read_session(a):
+    id=a['session_id']; p,fd=get_session(id)
+    wait=min(max(int(a.get('wait_ms',200)),0),1500)/1000
+    data=bytearray(); until=time.monotonic()+wait
+    while len(data)<48000:
+        ready,_,_=select.select([fd],[],[],max(0,until-time.monotonic()))
+        if not ready: break
+        try: new=os.read(fd,4096)
+        except OSError: break
+        if not new: break
+        data.extend(new)
+        if time.monotonic()>=until: break
+    return {'session_id':id,'running':p.poll() is None,'output':data.decode('utf-8','replace')}
+def send_session(a):
+    p,fd=get_session(a['session_id'])
+    text=a['input']
+    if len(text)>10000: raise ValueError('Input too long')
+    os.write(fd,text.encode())
+    return read_session(a)
+def sessions(a):
+    with LOCK: items=list(SESSIONS.items())
+    return {'sessions':[{'id':i,'pid':v[0].pid,'running':v[0].poll() is None} for i,v in items]}
+def stop_session(a):
+    id=a['session_id']; p,fd=get_session(id)
+    if p.poll() is None: os.killpg(p.pid,signal.SIGTERM)
+    os.close(fd)
+    with LOCK: SESSIONS.pop(id,None)
+    return {'stopped':id}
+def readpdf(a):
+    p=str(path(a['path'])); pages=max(1,min(30,int(a.get('pages',15))))
+    return run({'command':'pdftotext -f 1 -l '+str(pages)+' -layout -- '+__import__('shlex').quote(p)+' -','timeout_seconds':30})
+def writepdf(a):
+    p=path(a['path'])
+    if p.exists() and not a.get('overwrite',False): raise FileExistsError(str(p))
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+    c=canvas.Canvas(str(p),pagesize=letter); y=745
+    for line in a['text'].splitlines():
+        while len(line)>100:
+            c.drawString(40,y,line[:100]); line=line[100:]; y-=13
+            if y<50: c.showPage(); y=745
+        c.drawString(40,y,line); y-=13
+        if y<50: c.showPage(); y=745
+    c.save()
+    return {'path':str(p),'bytes':p.stat().st_size}
+def readurl(a):
+    url=a['url']
+    if not url.startswith('https://'): raise ValueError('HTTPS required')
+    return run({'command':'curl -fLsS --max-time 15 --max-filesize 131072 '+__import__('shlex').quote(url),'timeout_seconds':20})
+DISPATCH.update({'read_multiple_files':many,'edit_block':edit,'get_file_info':stat,'create_directory':mkdir,'move_file':move,'search_files':search,'list_processes':processes,'kill_process':kill,'list_ports':ports,'service_status':service,'service_action':serviceact,'list_jobs':jobs,'start_session':start_session,'session_input':send_session,'session_output':read_session,'list_sessions':sessions,'stop_session':stop_session,'read_pdf':readpdf,'write_pdf':writepdf,'read_url':readurl})
+
 def handle(m):
     method=m.get('method'); p=m.get('params') or {}
     if method=='initialize':
